@@ -1,0 +1,681 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BEAMDASH_ROOT="$(cd "$(dirname "$0")" && pwd)"
+export BEAMDASH_ROOT
+
+source "${BEAMDASH_ROOT}/lib/functions.sh"
+
+usage() {
+    cat <<EOF
+beamdash v${BEAMDASH_VERSION} - BeamMP Server Management Tool
+
+Usage:
+    beamctl <command> [args...]
+
+Server Lifecycle:
+    create  <instance>              Create a new server instance
+    destroy <instance>              Remove a server instance permanently
+    start   <instance>              Start a server instance
+    stop    <instance>              Stop a server instance
+    restart <instance>              Restart a server instance
+    status  [instance]              Show status of all or one instance
+    logs    <instance>              Tail server logs
+
+Configuration:
+    config  <instance>              Show active configuration
+    set     <instance> <k>=<v>      Set a config value (e.g. Port=30814)
+    get     <instance> <key>        Get a config value
+
+Mod Management:
+    mod pool    <instance>          List all mods in the pool
+    mod active  <instance>          List mods currently in Resources/Client
+    mod enable  <instance> <mod>    Add a mod to the active manifest
+    mod disable <instance> <mod>    Remove a mod from the active manifest
+    mod sync    <instance>          Sync Resources/Client to match manifest
+    mod scan    <instance>          Scan Resources/Client and build manifest
+
+Presets (Map/Config Profiles):
+    preset save   <i> <name>        Save current config + mods as a preset
+    preset load   <i> <name>        Load a preset and sync mods, then restart
+    preset list   <i>               List saved presets
+    preset delete <i> <name>        Delete a preset
+
+Import / Install:
+    import  <src-dir> <instance>    Import an existing BeamMP server dir
+    install                         Install beamdash system-wide
+    update                          Download the latest BeamMP-Server binary
+    version                         Show version information
+
+Web API:
+    api start                       Start the beamdash REST API daemon
+    api stop                        Stop the API daemon
+    api restart                     Restart the API daemon
+    api status                      Show API daemon status
+    api key [show|generate]         Show or generate a new API key
+
+Examples:
+    beamctl create f1server
+    beamctl set f1server AuthKey="your-key"
+    beamctl mod pool f1server
+    beamctl mod enable f1server abudhabi.zip
+    beamctl mod sync f1server
+    beamctl preset save f1server monaco
+    beamctl preset load f1server monaco
+    beamctl api start
+EOF
+    exit 0
+}
+
+# -----------------------------------------------
+# INSTALL
+# -----------------------------------------------
+cmd_install() {
+    require_root
+    local target="/opt/beamdash"
+    if [[ -d "$target" ]]; then
+        echo "beamdash already installed at $target."
+        read -rp "Overwrite? [y/N] " reply
+        [[ "$reply" =~ ^[yY] ]] || exit 0
+    fi
+    rsync -a --delete "${BEAMDASH_ROOT}/" "$target/" 2>/dev/null || cp -a "${BEAMDASH_ROOT}/." "$target/"
+    id -u beammp &>/dev/null || useradd -r -s /sbin/nologin -M beammp
+    chown -R beammp:beammp "$target"
+    chmod +x "$target/bin/BeamMP-Server" "$target/beamctl"
+    ln -sf "$target/beamctl" /usr/local/bin/beamctl
+    mkdir -p /etc/beamdash
+    [[ -f /etc/beamdash/beamdash.conf ]] || cp "$target/conf/beamdash.conf" /etc/beamdash/beamdash.conf
+    cp "$target/conf/api.conf" /etc/beamdash/api.conf
+    cp "$target/conf/beammp-api.service" /etc/systemd/system/beammp-api.service
+    systemctl daemon-reload
+    echo "beamdash installed to $target"
+}
+
+# -----------------------------------------------
+# CREATE
+# -----------------------------------------------
+cmd_create() {
+    local name="$1"
+    [[ -z "$name" ]] && { echo "Usage: beamctl create <instance-name>" >&2; exit 1; }
+    local idir="$(instance_dir "$name")"
+    [[ -d "$idir" ]] && { echo "Error: instance '$name' already exists." >&2; exit 1; }
+
+    mkdir -p "$idir/presets" "$idir/Resources/Client" "$idir/Resources/Server" "$idir/mods"
+
+    cat > "$(instance_conf "$name")" <<-EOF
+[Misc]
+UpdateReminderTime = "30s"
+ImScaredOfUpdates = false
+
+[General]
+Description = "A BeamMP Server"
+MaxCars = 8
+LogChat = true
+ResourceFolder = "Resources"
+IP = "::"
+Name = "${name}"
+Private = false
+InformationPacket = true
+AllowGuests = true
+Port = 30814
+Debug = false
+Tags = "Freeroam"
+AuthKey = "CHANGE_ME"
+MaxPlayers = 10
+Map = "/levels/gridmap_v2/info.json"
+EOF
+
+    cat > "$(instance_mods_manifest "$name")" <<-EOF
+# Mod manifest for instance '$name'
+# List mod filenames (from mods/ pool) under each section
+# Run 'beamctl mod sync $name' to apply changes
+
+[client]
+# client mods go here, one per line:
+# "my-mod.zip"
+# "another-mod.zip"
+
+[server]
+# server-side mods go here
+EOF
+
+    touch "$(instance_log "$name")"
+    echo "Instance '$name' created."
+    echo "  Config:  $(instance_conf "$name")"
+    echo "  Mods:    $(instance_mods_manifest "$name")"
+    echo "  Pool:    $idir/mods/"
+    echo "Set AuthKey and add mods to get started."
+}
+
+# -----------------------------------------------
+# DESTROY
+# -----------------------------------------------
+cmd_destroy() {
+    local name="$1"
+    validate_instance "$name" || exit 1
+    is_running "$name" && cmd_stop "$name"
+    read -rp "Permanently destroy instance '$name'? [y/N] " reply
+    [[ "$reply" =~ ^[yY] ]] || exit 0
+    rm -rf "$(instance_dir "$name")"
+    rm -f "$(instance_log "$name")" "$(instance_pidfile "$name")"
+    echo "Instance '$name' destroyed."
+}
+
+# -----------------------------------------------
+# START / STOP / RESTART
+# -----------------------------------------------
+cmd_start() {
+    local name="$1"
+    validate_instance "$name" || exit 1
+    check_binary || exit 1
+    if is_running "$name"; then
+        echo "Instance '$name' is already running (pid $(get_pid "$name"))."
+        exit 0
+    fi
+    load_beamdash_conf
+    local idir="$(instance_dir "$name")"
+    local logfile="$(instance_log "$name")"
+    cd "$idir"
+    su -s /bin/bash "${DEFAULT_USER}" -c "nohup '${BEAMMP_BIN}' > '${logfile}' 2>&1 & echo \$!" > "$(instance_pidfile "$name")"
+    sleep 1
+    if is_running "$name"; then
+        echo "Instance '$name' started (pid $(get_pid "$name"))."
+    else
+        echo "Error: instance '$name' failed to start. Check: beamctl logs $name" >&2
+        rm -f "$(instance_pidfile "$name")"
+        exit 1
+    fi
+}
+
+cmd_stop() {
+    local name="$1"
+    validate_instance "$name" || exit 1
+    local pid=$(get_pid "$name")
+    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+        echo "Instance '$name' is not running."
+        rm -f "$(instance_pidfile "$name")"
+        return 0
+    fi
+    echo "Stopping instance '$name' (pid $pid)..."
+    kill "$pid" 2>/dev/null || true
+    for i in $(seq 1 10); do
+        ! kill -0 "$pid" 2>/dev/null && break
+        sleep 0.5
+    done
+    kill -9 "$pid" 2>/dev/null || true
+    rm -f "$(instance_pidfile "$name")"
+    echo "Instance '$name' stopped."
+}
+
+cmd_restart() {
+    cmd_stop "$1"
+    sleep 1
+    cmd_start "$1"
+}
+
+# -----------------------------------------------
+# STATUS
+# -----------------------------------------------
+cmd_status() {
+    load_beamdash_conf
+    local specific="$1"
+    local instances=()
+    if [[ -n "$specific" ]]; then
+        validate_instance "$specific" || exit 1
+        instances=("$specific")
+    else
+        instances=($(list_instances))
+    fi
+    [[ ${#instances[@]} -eq 0 ]] && { echo "No instances."; exit 0; }
+
+    printf "%-20s %-8s %-18s %-10s %s\n" "INSTANCE" "PORT" "MAP" "STATUS" "PID"
+    printf "%-20s %-8s %-18s %-10s %s\n" "--------" "----" "---" "------" "---"
+    for name in "${instances[@]}"; do
+        local conf="$(instance_conf "$name")"
+        local port=$(read_toml_val "$conf" "Port" || echo "?")
+        local map=$(read_toml_val "$conf" "Map" || echo "?")
+        map=$(basename "${map%/info.json}" 2>/dev/null || echo "$map")
+        local running="stopped" pid="-"
+        is_running "$name" && running="running" && pid=$(get_pid "$name")
+        printf "%-20s %-8s %-18s %-10s %s\n" "$name" "$port" "$map" "$running" "$pid"
+    done
+}
+
+# -----------------------------------------------
+# CONFIG / SET / GET
+# -----------------------------------------------
+cmd_config() {
+    local name="$1"
+    validate_instance "$name" || exit 1
+    [[ -f "$(instance_conf "$name")" ]] || { echo "No config found."; exit 1; }
+    cat "$(instance_conf "$name")"
+}
+
+cmd_set() {
+    local name="$1" kv="${2:-}"
+    validate_instance "$name" || exit 1
+    local conf="$(instance_conf "$name")"
+    [[ -f "$conf" ]] || { echo "Error: config not found." >&2; exit 1; }
+    [[ -z "$kv" || "$kv" != *"="* ]] && { echo "Usage: beamctl set <instance> key=value" >&2; exit 1; }
+    local key="${kv%%=*}" val="${kv#*=}"
+
+    if echo "$val" | grep -qP '^\d+$'; then repl="$val"
+    elif echo "$val" | grep -qiP '^(true|false)$'; then repl="$val"
+    else repl="\"${val}\""; fi
+
+    if grep -qE "^\s*${key}\s*=" "$conf"; then
+        sed -i "s|^\(${key}\s*=\s*\).*|\1${repl}|" "$conf"
+    else
+        sed -i "/^\[General\]/a ${key}=${repl}" "$conf"
+    fi
+    echo "Set $key = $val"
+}
+
+cmd_get() {
+    local name="$1" key="$2"
+    validate_instance "$name" || exit 1
+    read_toml_val "$(instance_conf "$name")" "$key" || echo "(not set)"
+}
+
+# -----------------------------------------------
+# LOGS
+# -----------------------------------------------
+cmd_logs() {
+    local name="$1"
+    validate_instance "$name" || exit 1
+    local logfile="$(instance_log "$name")"
+    [[ -f "$logfile" ]] || touch "$logfile"
+    tail -f "$logfile"
+}
+
+# -----------------------------------------------
+# LIST
+# -----------------------------------------------
+cmd_list() {
+    local instances=($(list_instances))
+    [[ ${#instances[@]} -eq 0 ]] && { echo "No instances."; exit 0; }
+    echo "Instances:"
+    for name in "${instances[@]}"; do
+        local status="stopped"
+        is_running "$name" && status="running"
+        echo "  - $name [$status]"
+    done
+}
+
+# -----------------------------------------------
+# MOD MANAGEMENT
+# -----------------------------------------------
+cmd_mod() {
+    local action="$1" name="$2"; shift 2
+    validate_instance "$name" || exit 1
+
+    case "$action" in
+        pool)
+            local pool="$(instance_dir "$name")/mods"
+            if [[ ! -d "$pool" ]]; then
+                echo "No mods pool directory: $pool"
+                exit 0
+            fi
+            local mods=()
+            while IFS= read -r f; do mods+=("$f"); done < <(collect_mods_pool "$pool")
+            if [[ ${#mods[@]} -eq 0 ]]; then
+                echo "Mods pool is empty. Place .zip files in $pool"
+            else
+                printf "Mods in pool (%d):\n" ${#mods[@]}
+                for m in "${mods[@]}"; do
+                    local size=$(stat -c%s "$pool/$m" 2>/dev/null | numfmt --to=iec 2>/dev/null || echo "?")
+                    echo "  $m ($size)"
+                done
+            fi
+            ;;
+        active)
+            local client_dir="$(instance_resources_client "$name")"
+            if [[ ! -d "$client_dir" ]]; then
+                echo "No Resources/Client directory."
+                exit 0
+            fi
+            local active=()
+            while IFS= read -r f; do active+=("$f"); done < <(ls "$client_dir"/*.zip 2>/dev/null | while read f; do basename "$f"; done)
+            if [[ ${#active[@]} -eq 0 ]]; then
+                echo "No mods in Resources/Client."
+            else
+                printf "Active client mods (%d):\n" ${#active[@]}
+                for m in "${active[@]}"; do
+                    local size=$(stat -c%s "$client_dir/$m" 2>/dev/null | numfmt --to=iec 2>/dev/null || echo "?")
+                    echo "  $m ($size)"
+                done
+            fi
+            ;;
+        enable)
+            local mod="${1:-}"
+            [[ -z "$mod" ]] && { echo "Usage: beamctl mod enable <instance> <mod-filename>" >&2; exit 1; }
+            local manifest="$(instance_mods_manifest "$name")"
+            if grep -qF "$mod" "$manifest"; then
+                echo "Mod '$mod' already in manifest."
+            else
+                sed -i "/^\[client\]/a \"${mod}\"" "$manifest"
+                echo "Added '$mod' to manifest. Run 'beamctl mod sync $name' to apply."
+            fi
+            ;;
+        disable)
+            local mod="${1:-}"
+            [[ -z "$mod" ]] && { echo "Usage: beamctl mod disable <instance> <mod-filename>" >&2; exit 1; }
+            local manifest="$(instance_mods_manifest "$name")"
+            if grep -qF "$mod" "$manifest"; then
+                sed -i "/${mod}/d" "$manifest"
+                echo "Removed '$mod' from manifest. Run 'beamctl mod sync $name' to apply."
+            else
+                echo "Mod '$mod' not in manifest."
+            fi
+            ;;
+        sync)
+            cmd_mod_sync "$name"
+            ;;
+        scan)
+            cmd_mod_scan "$name"
+            ;;
+        *)
+            echo "Usage: beamctl mod <pool|active|enable|disable|sync|scan> <instance> [args]" >&2
+            exit 1
+            ;;
+    esac
+}
+
+cmd_mod_sync() {
+    local name="$1"
+    local pool="$(instance_dir "$name")/mods"
+    local client_dir="$(instance_resources_client "$name")"
+    local manifest="$(instance_mods_manifest "$name")"
+
+    [[ -d "$pool" ]] || { echo "Error: mods pool not found at $pool" >&2; exit 1; }
+    [[ -f "$manifest" ]] || { echo "Error: mod manifest not found." >&2; exit 1; }
+
+    echo "Syncing mods for instance '$name'..."
+
+    local mods=()
+    while IFS= read -r line; do
+        line="$(echo "$line" | tr -d '"' | xargs)"
+        [[ -z "$line" || "$line" =~ ^[#\[] ]] && continue
+        mods+=("$line")
+    done < <(sed -n '/^\[client\]/,/^\[/p' "$manifest" | tail -n +2)
+
+    if is_running "$name"; then
+        echo "Server is running. Mod sync will take effect after restart."
+    fi
+
+    rm -f "$client_dir"/*.zip
+    local linked=0 missing=0
+    for mod in "${mods[@]}"; do
+        if [[ -f "$pool/$mod" ]]; then
+            link_mod "$pool/$mod" "$client_dir/$mod"
+            linked=$((linked + 1))
+        else
+            echo "  WARNING: '$mod' not found in mods pool"
+            missing=$((missing + 1))
+        fi
+    done
+
+    echo "  Linked $linked mods to Resources/Client/"
+    [[ $missing -gt 0 ]] && echo "  WARNING: $missing mods missing from pool"
+    rm -f "$client_dir/mods.json"
+    echo "Synced."
+}
+
+cmd_mod_scan() {
+    local name="$1"
+    local client_dir="$(instance_resources_client "$name")"
+    local manifest="$(instance_mods_manifest "$name")"
+    [[ -d "$client_dir" ]] || { echo "Resources/Client not found." >&2; exit 1; }
+
+    echo "Scanning Resources/Client for mods..."
+    {
+        echo "# Auto-scanned mod manifest for '$name'"
+        echo "# Generated by beamctl mod scan"
+        echo ""
+        echo "[client]"
+    } > "$manifest"
+
+    local count=0
+    for f in "$client_dir"/*.zip; do
+        [[ -f "$f" ]] || continue
+        echo "\"$(basename "$f")\"" >> "$manifest"
+        ((count++))
+    done
+    echo "" >> "$manifest"
+    echo "[server]" >> "$manifest"
+    echo "Scanned $count mods into manifest."
+}
+
+# -----------------------------------------------
+# PRESETS
+# -----------------------------------------------
+cmd_preset() {
+    local name="$1" action="$2"
+    validate_instance "$name" || exit 1
+    local conf="$(instance_conf "$name")"
+    local preset_dir="$(instance_presets_dir "$name")"
+
+    case "$action" in
+        save)
+            local preset_name="${3:-}"
+            [[ -z "$preset_name" ]] && { echo "Usage: beamctl preset <instance> save <name>" >&2; exit 1; }
+            mkdir -p "$preset_dir"
+            cp "$conf" "$(instance_preset_conf "$name" "$preset_name")"
+            cp "$(instance_mods_manifest "$name")" "$(instance_preset_mods "$name" "$preset_name")"
+            echo "Saved preset '$preset_name' (config + mods)."
+            ;;
+        load)
+            local preset_name="${3:-}"
+            [[ -z "$preset_name" ]] && { echo "Usage: beamctl preset <instance> load <name>" >&2; exit 1; }
+            local pconf="$(instance_preset_conf "$name" "$preset_name")"
+            local pmods="$(instance_preset_mods "$name" "$preset_name")"
+            [[ -f "$pconf" ]] || { echo "Error: preset '$preset_name' config not found." >&2; exit 1; }
+            cp "$pconf" "$conf"
+            echo "Loaded config from preset '$preset_name'."
+            if [[ -f "$pmods" ]]; then
+                cp "$pmods" "$(instance_mods_manifest "$name")"
+                cmd_mod_sync "$name"
+            fi
+            if is_running "$name"; then
+                cmd_restart "$name"
+            else
+                echo "Server is stopped; preset applied (start with 'beamctl start $name')."
+            fi
+            ;;
+        list)
+            local presets=()
+            for f in "$preset_dir"/*.toml; do
+                [[ -f "$f" && "$f" != *-mods.toml ]] && presets+=("$(basename "$f" .toml)")
+            done
+            if [[ ${#presets[@]} -eq 0 ]]; then
+                echo "No presets for '$name'."
+            else
+                echo "Presets for '$name':"
+                for p in "${presets[@]}"; do
+                    local has_mods=""
+                    [[ -f "$(instance_preset_mods "$name" "$p")" ]] && has_mods=" (with mods)"
+                    local map=$(read_toml_val "$(instance_preset_conf "$name" "$p")" "Map" 2>/dev/null || echo "?")
+                    echo "  - $p -> $map$has_mods"
+                done
+            fi
+            ;;
+        delete)
+            local preset_name="${3:-}"
+            [[ -z "$preset_name" ]] && { echo "Usage: beamctl preset <instance> delete <name>" >&2; exit 1; }
+            rm -f "$(instance_preset_conf "$name" "$preset_name")" "$(instance_preset_mods "$name" "$preset_name")"
+            echo "Deleted preset '$preset_name'."
+            ;;
+        *)
+            echo "Usage: beamctl preset <instance> <save|load|list|delete> [name]" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# -----------------------------------------------
+# IMPORT
+# -----------------------------------------------
+cmd_import() {
+    local src="$1" name="$2"
+    [[ -z "$src" || -z "$name" ]] && { echo "Usage: beamctl import <source-dir> <instance-name>" >&2; exit 1; }
+    [[ -d "$src" ]] || { echo "Error: source directory not found." >&2; exit 1; }
+    local idir="$(instance_dir "$name")"
+    [[ -d "$idir" ]] && { echo "Error: instance '$name' already exists." >&2; exit 1; }
+
+    mkdir -p "$idir/presets" "$idir/Resources/Client" "$idir/Resources/Server" "$idir/mods"
+
+    if [[ -f "$src/ServerConfig.toml" ]]; then
+        cp "$src/ServerConfig.toml" "$(instance_conf "$name")"
+    elif [[ -f "$src/ServerConfig.ini" ]]; then
+        echo "Warning: INI config detected, converting..."
+        cat > "$(instance_conf "$name")" <<-EOF
+[Misc]
+UpdateReminderTime = "30s"
+ImScaredOfUpdates = false
+
+[General]
+EOF
+        grep -vE '^#|^\[|^\s*$' "$src/ServerConfig.ini" >> "$(instance_conf "$name")"
+    else
+        echo "Error: no ServerConfig.toml found." >&2; exit 1
+    fi
+
+    if [[ -d "$src/Resources/Client" ]]; then
+        for f in "$src/Resources/Client"/*.zip; do
+            [[ -f "$f" ]] && cp "$f" "$idir/Resources/Client/"
+        done
+    fi
+    if [[ -d "$src/Resources/Server" ]]; then
+        for f in "$src/Resources/Server"/*; do
+            [[ -f "$f" ]] && cp "$f" "$idir/Resources/Server/"
+        done
+    fi
+    if [[ -d "$src/mods" ]]; then
+        for f in "$src/mods"/*.zip; do
+            [[ -f "$f" ]] && cp "$f" "$idir/mods/"
+        done
+    fi
+
+    cmd_mod_scan "$name"
+    echo "Imported instance '$name' from $src"
+    echo "  Mods found: $(ls "$idir/mods"/*.zip 2>/dev/null | wc -l) in pool, $(ls "$idir/Resources/Client"/*.zip 2>/dev/null | wc -l) active"
+    echo "Switch to mod pool management: beamctl mod pool $name"
+}
+
+# -----------------------------------------------
+# UPDATE
+# -----------------------------------------------
+cmd_update() {
+    require_root
+    echo "Fetching latest BeamMP-Server release..."
+    local json=$(curl -sL "https://api.github.com/repos/BeamMP/BeamMP-Server/releases/latest")
+    local tag=$(echo "$json" | grep -oP '"tag_name":\s*"\K[^"]+')
+    local url=$(echo "$json" | grep -oP '"browser_download_url":\s*"\K[^"]*ubuntu\.24\.04\.x86_64[^"]*' | head -1)
+    [[ -z "$url" ]] && { echo "Error: could not find download URL." >&2; exit 1; }
+    echo "Downloading $tag..."
+    local tmpfile=$(mktemp)
+    curl -sL -o "$tmpfile" "$url"
+    chmod +x "$tmpfile"
+    local old_bin="${BEAMMP_BIN}.bak"
+    [[ -f "$BEAMMP_BIN" ]] && mv "$BEAMMP_BIN" "$old_bin"
+    mv "$tmpfile" "$BEAMMP_BIN"
+    echo "Updated to $tag"
+}
+
+# -----------------------------------------------
+# VERSION
+# -----------------------------------------------
+cmd_version() {
+    echo "beamdash v${BEAMDASH_VERSION}"
+    if [[ -x "$BEAMMP_BIN" ]]; then
+        local ver=$("$BEAMMP_BIN" --version 2>/dev/null || echo "unknown")
+        echo "BeamMP-Server: $ver"
+    fi
+}
+
+# -----------------------------------------------
+# API
+# -----------------------------------------------
+cmd_api() {
+    local action="${1:-status}"
+    case "$action" in
+        start)
+            require_root
+            cp "${BEAMDASH_ROOT}/conf/beammp-api.service" /etc/systemd/system/beammp-api.service
+            systemctl daemon-reload
+            systemctl enable --now beammp-api
+            echo "beamdash API started on port 8999"
+            echo "  API key: $(grep ^KEY /etc/beamdash/api.conf 2>/dev/null | cut -d= -f2 || echo 'see /etc/beamdash/api.conf')"
+            ;;
+        stop)
+            require_root
+            systemctl disable --now beammp-api 2>/dev/null || true
+            echo "beamdash API stopped."
+            ;;
+        restart)
+            require_root
+            systemctl restart beammp-api
+            echo "beamdash API restarted."
+            ;;
+        status)
+            if systemctl is-active --quiet beammp-api 2>/dev/null; then
+                echo "beamdash API: running (port 8999)"
+                systemctl status beammp-api --no-pager 2>&1 | head -5
+            else
+                echo "beamdash API: not running"
+                echo "Start with: beamctl api start"
+            fi
+            ;;
+        key)
+            local keyfile="/etc/beamdash/api.conf"
+            local action="${2:-show}"
+            case "$action" in
+                generate|gen)
+                    require_root
+                    local newkey=$(openssl rand -hex 32 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(32))")
+                    if grep -qE '^KEY=' "$keyfile" 2>/dev/null; then
+                        sed -i "s|^KEY=.*|KEY=\"${newkey}\"|" "$keyfile"
+                    else
+                        echo "KEY=\"${newkey}\"" >> "$keyfile"
+                    fi
+                    echo "Generated new API key: $newkey"
+                    echo "Stored in $keyfile"
+                    ;;
+                show|*)
+                    if [[ -f "$keyfile" ]]; then
+                        local cur=$(grep ^KEY "$keyfile" | cut -d= -f2 | tr -d '"')
+                        if [[ -n "$cur" ]]; then
+                            echo "API key: $cur"
+                        else
+                            echo "No KEY set in $keyfile"
+                            echo "Generate one: beamctl api key generate"
+                        fi
+                    else
+                        echo "API not configured. Run 'beamctl api start' first."
+                    fi
+                    ;;
+            esac
+            ;;
+        *)
+            echo "Usage: beamctl api <start|stop|restart|status|key [show|generate]>" >&2
+            exit 1
+            ;;
+    esac
+}
+
+# -----------------------------------------------
+# MAIN
+# -----------------------------------------------
+main() {
+    [[ $# -eq 0 ]] && usage
+    cmd="cmd_$1"
+    shift
+    if declare -f "$cmd" >/dev/null; then
+        "$cmd" "$@"
+    else
+        echo "Unknown command: $1" >&2
+        usage
+    fi
+}
+
+main "$@"

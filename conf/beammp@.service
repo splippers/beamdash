@@ -1,0 +1,20 @@
+[Unit]
+Description=BeamMP Server Instance %i
+After=network.target
+Wants=network.target
+
+[Service]
+Type=forking
+User=beammp
+Group=beammp
+Environment=BEAMDASH_ROOT=/opt/beamdash
+ExecStart=/usr/local/bin/beamctl start %i
+ExecStop=/usr/local/bin/beamctl stop %i
+ExecReload=/usr/local/bin/beamctl restart %i
+PIDFile=/opt/beamdash/logs/%i.pid
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

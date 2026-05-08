@@ -1,0 +1,20 @@
+[Misc]
+UpdateReminderTime = "30s"
+ImScaredOfUpdates = false
+
+[General]
+Description = "West Coast Freeroam - beamdash managed"
+MaxCars = 24
+LogChat = true
+ResourceFolder = "Resources"
+IP = "::"
+Name = "beamdash West Coast Server"
+Private = false
+InformationPacket = true
+AllowGuests = true
+Port = 30814
+Debug = false
+Tags = "Freeroam"
+AuthKey = "CHANGE_ME"
+MaxPlayers = 16
+Map = "/levels/west_coast_usa/info.json"

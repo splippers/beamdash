@@ -1,0 +1,16 @@
+[Unit]
+Description=beamdash REST API
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=beammp
+Group=beammp
+ExecStart=/opt/beamdash/lib/api.py
+Restart=on-failure
+RestartSec=5
+Environment=BEAMDASH_ROOT=/opt/beamdash
+
+[Install]
+WantedBy=multi-user.target

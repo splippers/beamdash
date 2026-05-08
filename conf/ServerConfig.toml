@@ -1,0 +1,20 @@
+[Misc]
+UpdateReminderTime = "30s"
+ImScaredOfUpdates = false
+
+[General]
+Description = "Powered by beamdash"
+MaxCars = 8
+LogChat = true
+ResourceFolder = "Resources"
+IP = "::"
+Name = "BeamMP Server"
+Private = false
+InformationPacket = true
+AllowGuests = true
+Port = 30814
+Debug = false
+Tags = "Freeroam"
+AuthKey = "CHANGE_ME"
+MaxPlayers = 10
+Map = "/levels/gridmap_v2/info.json"
